@@ -10,7 +10,8 @@ Thumbs.db
 ### Compiled source and python caches ###
 *.pyc
 __pycache__
-
+##venv
+.drone
 ### Ignore data ###
 data/**
 

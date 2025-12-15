@@ -20,7 +20,7 @@ def temporal_smooth_metadata(metadata_path, output_path):
     df['dt'] = df['Time_s'].diff().fillna(0)
     
     # Calculate distance traveled between consecutive images (in meters)
-    distances = [0]
+    distances = [0.0]
     for i in range(1, len(df)):
         start_point = (df.loc[i-1, 'GPS_Latitude'], df.loc[i-1, 'GPS_Longitude'])
         end_point = (df.loc[i, 'GPS_Latitude'], df.loc[i, 'GPS_Longitude'])

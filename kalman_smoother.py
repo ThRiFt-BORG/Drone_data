@@ -39,7 +39,7 @@ def apply_kalman_filter(metadata_path, output_path):
     
     # Measurement Matrix (H)
     # We measure Lat (index 0) and Lon (index 2)
-    kf.H = np.array([[1., 0., 0., 0.],
+    kf.H = np.array([[1., 0., 0., 0.], # type: ignore
                      [0., 0., 1., 0.]])
     
     # Measurement Noise (R)

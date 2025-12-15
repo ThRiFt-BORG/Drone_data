@@ -1,155 +1,176 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Aug 12 08:44:17 2019
+Metadata Extractor for Drone Images
+Rewritten to compliment the preprocessing script.
 
-Extracts longitude, latitude, altitude, pitch, yaw and roll information for each point that an image was taken.
-Also extracts number of satelites used to get the GNSS position, HDop, VDop, HAcc, VAcc (accuracy and dilution of position stats).
+1. Scans a directory for JPG images.
+2. Extracts GPS (Lat/Lon/Alt) and Timestamp from EXIF.
+3. Extracts Orientation (Yaw/Pitch/Roll) from DJI XMP packets.
+4. Outputs a CSV formatted specifically for the next processing step.
 
-@author: rr
+@author: rr (Updated by Assistant)
 """
 
-import pandas as pd;
-import numpy as np;
-from string import Template;
-from os import path, walk;
-from datetime import datetime;
-import gdal;
+import pandas as pd
+import os
+import glob
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
 
+# --- Configuration ---
+# Update these paths to match your folder structure
+IMAGE_DIRECTORY = "D:/WORK/Drone_Task/Drone_data/images" 
+OUTPUT_FILEPATH = "image_metadata.csv" # This matches the input name for your second code
 
-#Returns the row from inputDF which has the closest value to the target in the given column
-#inputDF: The dataframe to search in
-#column: The rwo in inputDF to search in
-#target: The value to match to
-#maxDiff: Optional. If not None, no row will be returned if the difference between target value and closest value exceeds maxDiff
-def find_closest_row(inputDF, column, target, maxDiff=None):
-    index = np.abs(inputDF[column]-target).idxmin();
-    if maxDiff != None:
-        if np.abs(inputDF.iloc[index][column] - target) > maxDiff: #If the difference is bigger than the threshold
-            return None;
-    return inputDF.iloc[index]; #Difference is acceptable, return the closest row
+# --- Helper Functions ---
 
+def get_exif_data(image):
+    """Returns a dictionary from the exif data of an PIL Image item. Also converts the GPS Tags"""
+    exif_data = {}
+    info = image._getexif()
+    if info:
+        for tag, value in info.items():
+            decoded = TAGS.get(tag, tag)
+            if decoded == "GPSInfo":
+                gps_data = {}
+                for t in value:
+                    sub_decoded = GPSTAGS.get(t, t)
+                    gps_data[sub_decoded] = value[t]
+                exif_data[decoded] = gps_data
+            else:
+                exif_data[decoded] = value
+    return exif_data
 
-#Paths
-#imageDirectory = "/home/rr/Files/Tasks/20190802_drone_images/test_data/Fieldwork 17_5_24/Both"; #Directory containing images to be processed
-#inputPathTemplate = Template("/home/rr/Files/Tasks/20190802_drone_images/test_data/Fieldwork 17_5_24/Flight Logs/Separated/23 24-05-2017 17-09-58_TMH_${NAME}.csv");
-#outputFilePath = "/home/rr/Files/Tasks/20190802_drone_images/test_data/Fieldwork 17_5_24/image_data_tmh.csv";
+def convert_to_dms_string(value, ref):
+    """
+    Converts tuple (deg, min, sec) to string format: "2 deg 10' 52.30" S"
+    This ensures compatibility with the Regex in your Code 2.
+    """
+    try:
+        d = float(value[0])
+        m = float(value[1])
+        s = float(value[2])
+        return f'{int(d)} deg {int(m)}\' {s:.2f}" {ref}'
+    except Exception:
+        return None
 
+def parse_dji_xmp(filepath):
+    """
+    Scans the raw binary of the file to find DJI XMP text tags for orientation.
+    This is necessary because standard libraries often skip XMP data.
+    """
+    xmp_data = {'Pitch': 0.0, 'Roll': 0.0, 'Yaw': 0.0}
+    try:
+        with open(filepath, 'rb') as f:
+            content = f.read()
+            # Look for common DJI XMP tags
+            # FlightRollDegree, FlightPitchDegree, FlightYawDegree are common in DJI
+            # Sometimes encoded as GimbalRollDegree, etc.
+            
+            # Helper to find tag value
+            def find_tag(tag_name):
+                pattern = f'{tag_name}="'.encode('utf-8')
+                start = content.find(pattern)
+                if start != -1:
+                    start += len(pattern)
+                    end = content.find(b'"', start)
+                    if end != -1:
+                        return float(content[start:end])
+                return None
 
+            # Try different variations of tag names used by DJI
+            roll = find_tag('FlightRollDegree') or find_tag('GimbalRollDegree')
+            pitch = find_tag('FlightPitchDegree') or find_tag('GimbalPitchDegree')
+            yaw = find_tag('FlightYawDegree') or find_tag('GimbalYawDegree')
 
-#Read drone data
-#camData = pd.read_csv(inputPathTemplate.safe_substitute(NAME="CAM"));
-#gpsData = pd.read_csv(inputPathTemplate.safe_substitute(NAME="GPS"));
-#attData = pd.read_csv(inputPathTemplate.safe_substitute(NAME="ATT"));
+            if roll is not None: xmp_data['Roll'] = roll
+            if pitch is not None: xmp_data['Pitch'] = pitch
+            if yaw is not None: xmp_data['Yaw'] = yaw
 
-#Extract the position and orientation data for each image file and save as a csv.
-def extract_image_data(imageDirectory, outputFilePath, separatedLogFileTemplate):
+    except Exception as e:
+        print(f"Warning reading XMP for {os.path.basename(filepath)}: {e}")
     
-    gpsData = pd.read_table(separatedLogFileTemplate.safe_substitute(NAME="GPS"), sep=',');
-    attData = pd.read_table(separatedLogFileTemplate.safe_substitute(NAME="ATT"), sep=',');
-    camData = pd.read_table(separatedLogFileTemplate.safe_substitute(NAME="CAM"), sep=',');
-    
-    #Get list of images to process
-    imageFilenameList = [filename for filename in next(walk(imageDirectory))[2] if filename[0] != '.']; #Ignore hidden files
-    imageFilenameList.sort();
-    firstImageFilename = imageFilenameList[0]; #Use this later to find the time of the first image taken (this is equated to CAM
-                                               #drone time in MS and used to calculate drone time for all other photos)
-                                               #Note: First tile is a .RAW so we can't read the Exif and must use filename instead
-    imageFilenameList = [filename for filename in imageFilenameList if filename[-4:].lower() == ".jpg"]; #Remove anything that isn't a .jpg
+    return xmp_data
 
+# --- Main Extraction Logic ---
 
-    #Get list containing metadata for each image
-    imageMetaDataList = [];
-    for filename in imageFilenameList:
-        imagePath = path.join(imageDirectory, filename);
-        imageData = gdal.Open(imagePath, gdal.GA_ReadOnly);
-        metaData = imageData.GetMetadata();
-        metaData["filename"] = filename; #Add filename (helps with debugging)
-        imageMetaDataList.append(metaData);
+def extract_image_data(image_dir, output_path):
+    print(f"Scanning images in: {image_dir}")
     
+    # Get list of images
+    image_files = glob.glob(os.path.join(image_dir, "*.JPG")) + glob.glob(os.path.join(image_dir, "*.jpg"))
+    image_files.sort()
     
-    #For each image, find the datetime it was turned on and calculate the corresponding drone time.
-    cameraStartTimeMS = camData.iloc[0]["TimeMS"]; #Read time (drone time) when the camera was turned on: Assumes this is also time of first photo being taken
-    firstCameraDatetime = datetime.strptime(firstImageFilename[:-8], "%Y_%m%d_%H%M%S"); #Process firstImageFilename to get datetime
-    for imageMetaData in imageMetaDataList:
-        cameraDatetime = datetime.strptime(imageMetaData["EXIF_DateTime"], "%Y:%m:%d %H:%M:%S"); #from Exif data
-        imageMetaData["imageDate"] = cameraDatetime;
-        #cameraDatetime = datetime.strptime(imageMetaData["filename"][:-8], "%Y_%m%d_%H%M%S"); #from filename
-        cameraDroneTime = cameraDatetime-firstCameraDatetime; #Time since first photo taken in seconds
-        imageMetaData["droneTime_MS"] = cameraDroneTime.total_seconds()*1000.0 + cameraStartTimeMS; #Drone time in MS
-    
-    
-    #For each photo, find the ATT and GPS entries that are closest to the time the photo was taken.
-    #Does not perform interpolation
-    for imageMetaData in imageMetaDataList:
-        imageTime = imageMetaData["droneTime_MS"];
+    if not image_files:
+        print("No .jpg images found!")
+        return
+
+    metadata_list = []
+
+    for filepath in image_files:
+        filename = os.path.basename(filepath)
+        print(f"Processing {filename}...", end='\r')
         
-        #Process orientation
-        attRow = find_closest_row(attData, "TimeMS", imageTime, maxDiff=1000);
-        if attRow is not None:
-            imageMetaData["ATT_Roll"] = attRow["Roll"];
-            imageMetaData["ATT_Pitch"] = attRow["Pitch"];
-            imageMetaData["ATT_Yaw"] = attRow["Yaw"];
-        else: #Camera turned off after drone, so may have some photos with no data. Set attributes to no.nan
-            imageMetaData["ATT_Roll"] = imageMetaData["ATT_Pitch"] = imageMetaData["ATT_Yaw"] = np.nan;
-        
-        #Process position
-        gpsRow = find_closest_row(gpsData, "TimeMS", imageTime, maxDiff=1000);
-        if gpsRow is not None:
-            imageMetaData["GPS_NSats"] = gpsRow["NSats"];
-            imageMetaData["GPS_HDop"] = gpsRow["HDop"];
-            imageMetaData["GPS_Longitude"] = gpsRow["Lng"];
-            imageMetaData["GPS_Latitude"] = gpsRow["Lat"];
-            imageMetaData["GPS_Altitude"] = gpsRow["Alt"];
-            imageMetaData["GPS_RelAltitude"] = gpsRow["RelAlt"];
-        else: #Camera turned off after drone, so may have some photos with no data. Set attributes to no.nan
-            imageMetaData["GPS_NSats"] = imageMetaData["GPS_HDop"] = imageMetaData["GPS_Longitude"] = imageMetaData["GPS_Latitude"] = imageMetaData["GPS_Altitude"] = imageMetaData["GPS_RelAltitude"] = np.nan;
-    
-    
-    
-    #Create a new dataframe with all the image data in, and write it to file
-    cols = ["filename", "imageDate", "droneTime_MS", "GPS_Longitude", "GPS_Latitude", "GPS_Altitude", "ATT_Roll", "ATT_Pitch", "ATT_Yaw",
-            "GPS_RelAltitude", "GPS_NSats", "GPS_HDop"];
-    outputDF = pd.DataFrame();
-    for col in cols:
-        outputDF[col] = [imageMetaData[col] for imageMetaData in imageMetaDataList];
-    outputDF.to_csv(outputFilePath, sep=",", index=False);
+        row_data = {
+            'FileName': filename,
+            'DateTimeOriginal': None,
+            'GPSLatitude': None,
+            'GPSLongitude': None,
+            'GPSAltitude': None,
+            'Pitch': 0,
+            'Roll': 0,
+            'Yaw': 0
+        }
 
+        try:
+            img = Image.open(filepath)
+            exif = get_exif_data(img)
+            
+            # 1. Get DateTime
+            if 'DateTimeOriginal' in exif:
+                row_data['DateTimeOriginal'] = exif['DateTimeOriginal']
+            
+            # 2. Get GPS (Formatted for Code 2 regex)
+            if 'GPSInfo' in exif:
+                gps = exif['GPSInfo']
+                
+                # Latitude
+                if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
+                    row_data['GPSLatitude'] = convert_to_dms_string(gps['GPSLatitude'], gps['GPSLatitudeRef'])
+                
+                # Longitude
+                if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
+                    row_data['GPSLongitude'] = convert_to_dms_string(gps['GPSLongitude'], gps['GPSLongitudeRef'])
+                
+                # Altitude
+                if 'GPSAltitude' in gps:
+                    # Append 'm' so Code 2's cleaning logic works
+                    row_data['GPSAltitude'] = f"{float(gps['GPSAltitude'])} m Above Sea Level"
 
-#droneTime (time since reset, seems to be in um (microseconds), or whatever units the "TimeMS" column is in for this log version)
-#maxTimeDifference should be specified in the same units as droneTime
-def extract_data_for_single_image(imagePath, separatedLogFileTemplate, droneTime, maxTimeDifference=1000, timeColName="TimeMS"):
-    gpsData = pd.read_table(separatedLogFileTemplate.safe_substitute(NAME="GPS"), sep=',', index_col=False);
-    attData = pd.read_table(separatedLogFileTemplate.safe_substitute(NAME="ATT"), sep=',', index_col=False);
-    
-    #read EXIF for image date/time
-    dataset = gdal.Open(imagePath, gdal.GA_ReadOnly);
-    metadata = dataset.GetMetadata();
-    datetime = metadata["EXIF_DateTime"];
-    #print(datetime);
-    
-    #Process position
-    gpsRow = find_closest_row(gpsData, timeColName, droneTime, maxDiff=maxTimeDifference);
-    if gpsRow is not None:
-        nsats = gpsRow["NSats"];
-        hdop = gpsRow["HDop"];
-        longitude = gpsRow["Lng"];
-        latitude = gpsRow["Lat"];
-        altitude = gpsRow["Alt"];
-        relAltitude = gpsRow["RelAlt"];
-    else: #Camera turned off after drone, so may have some photos with no data. Set attributes to no.nan
-        nsats = hdop = longitude = latitude = altitude = relAltitude = np.nan;
-    
-    attRow = find_closest_row(attData, timeColName, droneTime, maxDiff=maxTimeDifference);
-    if attRow is not None:
-        roll = attRow["Roll"];
-        pitch = attRow["Pitch"];
-        yaw = attRow["Yaw"];
-    else: #Camera turned off after drone, so may have some photos with no data. Set attributes to no.nan
-        roll = pitch = yaw = np.nan;
-    
-    return imagePath, datetime, droneTime, longitude, latitude, altitude, roll, pitch, yaw, relAltitude, nsats, hdop;
-    
+            # 3. Get Orientation (XMP)
+            # DJI writes this in XMP, not standard EXIF
+            xmp = parse_dji_xmp(filepath)
+            row_data['Pitch'] = xmp['Pitch']
+            row_data['Roll'] = xmp['Roll']
+            row_data['Yaw'] = xmp['Yaw']
+            
+            metadata_list.append(row_data)
 
+        except Exception as e:
+            print(f"\nError processing {filename}: {e}")
 
+    # Create DataFrame
+    df = pd.DataFrame(metadata_list)
+    
+    # Save to CSV
+    df.to_csv(output_path, index=False)
+    print(f"\n\nExtraction complete.")
+    print(f"Saved {len(df)} rows to: {output_path}")
+    print("You can now run your second script (preprocessing).")
 
+if __name__ == "__main__":
+    if os.path.exists(IMAGE_DIRECTORY):
+        extract_image_data(IMAGE_DIRECTORY, OUTPUT_FILEPATH)
+    else:
+        print(f"Error: Directory not found: {IMAGE_DIRECTORY}")

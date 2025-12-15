@@ -18,7 +18,7 @@ import os.path as path;
 import numpy as np;
 from netCDF4 import Dataset;
 from string import Template;
-import gdal;
+from osgeo import gdal;
 #import matplotlib.pyplot as plt;
 
 import yaw_from_glitter;

@@ -11,8 +11,7 @@ Updated from do_analysis.py
 from os import path, makedirs;
 import pandas as pd;
 from string import Template;
-import gdal;
-
+from osgeo import gdal
 from ardupilot_logreader import separate_ardupilot_logs;
 from image_data_extraction import extract_image_data;
 import analysis_utilities as utilities;
@@ -111,8 +110,8 @@ for imageDataRow in stationaryImages:
     #time = imageDataRow["time"];
     longitude = float(imageDataRow["GPS_Longitude"]);
     latitude = float(imageDataRow["GPS_Latitude"]);
-    altitude = float(imageDataRow["GPS_Altitude"])/1000.0; #m to km
-    relAltitude = float(imageDataRow["GPS_RelAltitude"])/1000.0; #m to km
+    altitude = float(imageDataRow["GPS_Altitude"]);
+    relAltitude = float(imageDataRow["GPS_RelAltitude"]);
     roll = float(imageDataRow["ATT_Roll"]);
     pitch = float(imageDataRow["ATT_Pitch"]);
     yaw = float(imageDataRow["ATT_Yaw"]);

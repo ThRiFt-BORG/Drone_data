@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified Georeferencing Tool
-Contains the Critical Shape Mismatch Fix (imageData.T)
+Unified Georeferencing Tool (Final Integrated Version)
+- Supports NetCDF and GeoTIFF generation.
+- Supports Metadata-driven Georeferencing.
+- Supports Sun-Glitter Yaw Correction (Integrated).
+- Contains the Critical Shape Mismatch Fix.
 """
 
 import georef_tools
@@ -11,6 +14,10 @@ import os
 import os.path as path
 import numpy as np
 from string import Template
+import datetime
+from dateutil import parser # Required for parsing timestamp strings
+
+# --- Import Glitter Module ---
 import yaw_from_glitter
 
 # --- Dependency Management ---
@@ -23,7 +30,7 @@ except ImportError:
 
 try:
     from osgeo import gdal
-    gdal.UseExceptions() # Enable exceptions for better error handling
+    gdal.UseExceptions()
     HAS_GDAL = True
 except ImportError:
     HAS_GDAL = False
@@ -38,65 +45,45 @@ DEFAULT_ASPECT_RATIO = DEFAULT_N_PIXELS_X / DEFAULT_N_PIXELS_Y
 def print_ge(lonlat):
     print(str(lonlat[1])+", "+str(lonlat[0]))
 
-# Writes pixel longitude and latitude information to NetCDF file.
 def write_netcdf(outputPath, lons, lats, imageMetaData, imageData=None):
     if not HAS_NETCDF:
-        print(f"Skipping NetCDF write for {outputPath} (Library missing)")
         return
 
     try:
         nc = Dataset(outputPath, 'w')
-        
-        # Dimensions: NetCDF usually uses (X, Y) or (Lon, Lat) convention in this script
         nc.createDimension("pixelsX", imageMetaData["num_pixels_x"])
         nc.createDimension("pixelsY", imageMetaData["num_pixels_y"])
         
         var = nc.createVariable("X", int, ("pixelsX",))
-        var.long_name = "Image pixel X coordinates."
-        var.units = "indices"
         var[:] = np.arange(0, imageMetaData["num_pixels_x"])
         
         var = nc.createVariable("Y", int, ("pixelsY",))
-        var.long_name = "Image pixel Y coordinates."
-        var.units = "indices"
         var[:] = np.arange(0, imageMetaData["num_pixels_y"])
         
-        # Set attributes
         for key in imageMetaData.keys():
             if imageMetaData[key] is not None:
                 nc.setncattr(key, imageMetaData[key])
         
-        # Write variables
         var = nc.createVariable("pixel_longitude", float, ("pixelsX", "pixelsY"))
-        var.long_name = "Longitude coordinate"
         var.units = "Decimal degrees East"
         var[:] = lons
         
         var = nc.createVariable("pixel_latitude", float, ("pixelsX", "pixelsY"))
-        var.long_name = "Latitude coordinate"
         var.units = "Decimal degrees North"
         var[:] = lats
           
         if imageData is not None:
             var = nc.createVariable("pixel_intensity", float, ("pixelsX", "pixelsY"))
-            var.long_name = "Near IR intensity for each pixel"
-            var.units = "Intensity (0-255)"
             try:
-                # --- THE CRITICAL FIX IS HERE ---
-                # GDAL returns (Y, X). NetCDF expects (X, Y).
-                # We must Transpose (.T) the array to flip it.
+                # Transpose Fix
                 var[:] = imageData.T 
-            except IndexError:
-                print("imageData dimensions do not match specified pixel width/height.")
-            except ValueError as e:
-                print(f"Shape Mismatch Error: {e}. Attempting to save without image data.")
+            except Exception as e:
+                print(f"Error saving image data to NetCDF: {e}")
     
         nc.close()
     except Exception as e:
-        print(f"Error creating NetCDF: {e}")
+        print(f"NetCDF Error: {e}")
 
-
-# Does the actual georeferencing operation
 def do_georeference(droneLonLat, droneAltitude, droneRoll, dronePitch, droneYaw, cameraPitch, cameraYaw, nPixelsX, nPixelsY, hFov, aspectRatio):
     totalImagePitch = cameraPitch + np.cos(np.deg2rad(cameraYaw))*dronePitch - np.sin(np.deg2rad(cameraYaw))*droneRoll
     totalImageRoll = np.sin(np.deg2rad(cameraYaw))*dronePitch + np.cos(np.deg2rad(cameraYaw))*droneRoll
@@ -126,13 +113,10 @@ def do_georeference(droneLonLat, droneAltitude, droneRoll, dronePitch, droneYaw,
     
     return lons, lats, imageRefLonLats
 
-# Geotransforms the image based on four corner GCPs
 def do_image_geotransform(originalPath, imageMetaData, outputPathTemplate, warning=True):
     if not HAS_GDAL:
-        print("Skipping GeoTransform (GDAL library missing)")
         return
 
-    # Using float() to ensure compatibility
     gcps = [
         gdal.GCP(imageMetaData["refpoint_topleft_lon"], imageMetaData["refpoint_topleft_lat"], 0, float(imageMetaData["num_pixels_x"]-1), float(imageMetaData["num_pixels_y"]-1)),
         gdal.GCP(imageMetaData["refpoint_topright_lon"], imageMetaData["refpoint_topright_lat"], 0, float(imageMetaData["num_pixels_x"]-1), 0),
@@ -142,18 +126,15 @@ def do_image_geotransform(originalPath, imageMetaData, outputPathTemplate, warni
     
     try:
         ds = gdal.Open(originalPath, gdal.GA_ReadOnly)
-        # Create VRT with GCPs
         ds = gdal.Translate(outputPathTemplate.safe_substitute(EXTENSION="vrt"), ds, outputSRS = 'EPSG:4326', GCPs = gcps, format="VRT")
         ds = None
-        
-        # Warp to TIF using command line for robustness against environment issues
         cmd = "gdalwarp -s_srs EPSG:4326 -t_srs EPSG:4326 -r cubic -dstalpha "+outputPathTemplate.safe_substitute(EXTENSION="vrt")+" "+outputPathTemplate.safe_substitute(EXTENSION="tif")
         os.system(cmd)
     except Exception as e:
         print(f"GeoTransform Error: {e}")
 
-# Main Processing Function
-def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLogPath=None, cameraPitch=30.0, suffix="", cameraYaw=90):
+# --- MAIN PROCESSING FUNCTION (UPDATED) ---
+def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLogPath=None, cameraPitch=30.0, suffix="", cameraYaw=90, enableGlitter=False, glitterThreshold=0.5):
     if not path.exists(outputDirectory):
         os.makedirs(outputDirectory)
 
@@ -164,12 +145,9 @@ def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLo
             print(f"Error: Metadata file not found at {imageData}")
             return
 
-    # Check for optional external logs
     droneParams = None
     if droneParmsLogPath and os.path.exists(droneParmsLogPath):
         droneParams = pd.read_csv(droneParmsLogPath, sep=",")
-    else:
-        print("Note: No external drone parameters log provided (or file not found). Processing with basic metadata only.")
 
     for r in range(len(imageData)):
         if isinstance(imageData, pd.DataFrame):
@@ -178,6 +156,7 @@ def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLo
             imageDataRow = imageData[r]
         
         try:
+            imageFilename = imageDataRow["filename"]
             dronePitch = imageDataRow["ATT_Pitch"]
             droneRoll = imageDataRow["ATT_Roll"]
             droneYaw = imageDataRow["ATT_Yaw"]
@@ -186,7 +165,9 @@ def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLo
             droneAltitude = imageDataRow["GPS_Altitude"] 
             droneNSats = imageDataRow.get("GPS_NSats", 0) 
             droneHDop = imageDataRow.get("GPS_HDop", 0)
-            imageFilename = imageDataRow["filename"]
+            
+            # Timestamp needed for Glitter analysis
+            raw_time = imageDataRow.get("DateTimeOriginal", None) 
         except KeyError:
             continue
     
@@ -200,7 +181,32 @@ def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLo
         if not np.isfinite(droneAltitude):
             continue
 
-        # Dynamic Size Detection
+        # --- OPTIONAL: GLITTER YAW CORRECTION ---
+        if enableGlitter and raw_time:
+            imagePath = path.join(imageDirectory, imageFilename)
+            if os.path.exists(imagePath):
+                try:
+                    # Convert string date to datetime object with TZ
+                    # Format usually "YYYY:MM:DD HH:MM:SS"
+                    date_obj = parser.parse(str(raw_time).replace(':', '-', 2))
+                    # Add simple UTC info if missing (required by pysolar)
+                    if date_obj.tzinfo is None:
+                        date_obj = date_obj.replace(tzinfo=datetime.timezone.utc)
+
+                    print("  > Attempting Yaw from Glitter...", end="")
+                    glitter_yaw = yaw_from_glitter.calc_yaw_from_ellipse(
+                        imagePath, date_obj, droneLonLat[0], droneLonLat[1], threshold=glitterThreshold, makePlots=False
+                    )
+                    
+                    if glitter_yaw is not None:
+                        print(f" Success! New Yaw: {glitter_yaw:.2f} (Old: {droneYaw:.2f})")
+                        droneYaw = glitter_yaw
+                    else:
+                        print(" Failed (No glitter detected). Using Metadata Yaw.")
+                except Exception as e:
+                    print(f" Glitter Error: {e}. Using Metadata Yaw.")
+
+        # --- Dynamic Size Detection ---
         current_n_pixels_x = DEFAULT_N_PIXELS_X
         current_n_pixels_y = DEFAULT_N_PIXELS_Y
         current_fov = DEFAULT_HORIZONTAL_FOV
@@ -211,50 +217,52 @@ def georeference_images(imageData, imageDirectory, outputDirectory, droneParmsLo
             imagePath = path.join(imageDirectory, imageFilename)
             try:
                 if os.path.exists(imagePath):
-                    imageDataset = gdal.Open(imagePath, gdal.GA_ReadOnly)
-                    if imageDataset:
-                        current_n_pixels_x = imageDataset.RasterXSize
-                        current_n_pixels_y = imageDataset.RasterYSize
+                    ds = gdal.Open(imagePath, gdal.GA_ReadOnly)
+                    if ds:
+                        current_n_pixels_x = ds.RasterXSize
+                        current_n_pixels_y = ds.RasterYSize
                         current_aspect = float(current_n_pixels_x) / float(current_n_pixels_y)
-                        imageDataArray = imageDataset.GetRasterBand(1).ReadAsArray()
+                        imageDataArray = ds.GetRasterBand(1).ReadAsArray()
             except Exception:
                 pass
 
+        # --- Core Calculation ---
         lons, lats, refPoints = do_georeference(
             droneLonLat, droneAltitude, droneRoll, dronePitch, droneYaw, 
             cameraPitch, cameraYaw, 
             current_n_pixels_x, current_n_pixels_y, current_fov, current_aspect
         )
 
+        # --- Saving Output ---
         if HAS_GDAL or HAS_NETCDF:
-            metaData = {}
-            metaData["image_filename"] = imageFilename
-            metaData["drone_pitch"] = dronePitch
-            metaData["drone_roll"] = droneRoll
-            metaData["drone_yaw"] = droneYaw
-            metaData["drone_longitude"] = droneLonLat[0]
-            metaData["drone_latitude"] = droneLonLat[1]
-            metaData["drone_altitude"] = droneAltitude
-            metaData["drone_time_ms"] = droneTimeMS
-            metaData["gps_n_satellites"] = droneNSats
-            metaData["gps_HDop"] = droneHDop
-            metaData["camera_pitch"] = cameraPitch
-            metaData["camera_yaw"] = cameraYaw
-            metaData["camera_horizontal_field_of_view"] = current_fov
-            metaData["camera_aspect_ratio"] = current_aspect
-            metaData["num_pixels_x"] = current_n_pixels_x
-            metaData["num_pixels_y"] = current_n_pixels_y
-            
-            metaData["refpoint_centre_lon"] = refPoints[0][0]
-            metaData["refpoint_centre_lat"] = refPoints[0][1]
-            metaData["refpoint_topleft_lon"] = refPoints[1][0]
-            metaData["refpoint_topleft_lat"] = refPoints[1][1]
-            metaData["refpoint_topright_lon"] = refPoints[2][0]
-            metaData["refpoint_topright_lat"] = refPoints[2][1]
-            metaData["refpoint_bottomleft_lon"] = refPoints[3][0]
-            metaData["refpoint_bottomleft_lat"] = refPoints[3][1]
-            metaData["refpoint_bottomright_lon"] = refPoints[4][0]
-            metaData["refpoint_bottomright_lat"] = refPoints[4][1]
+            metaData = {
+                "image_filename": imageFilename,
+                "drone_pitch": dronePitch,
+                "drone_roll": droneRoll,
+                "drone_yaw": droneYaw,
+                "drone_longitude": droneLonLat[0],
+                "drone_latitude": droneLonLat[1],
+                "drone_altitude": droneAltitude,
+                "drone_time_ms": droneTimeMS,
+                "gps_n_satellites": droneNSats,
+                "gps_HDop": droneHDop,
+                "camera_pitch": cameraPitch,
+                "camera_yaw": cameraYaw,
+                "camera_horizontal_field_of_view": current_fov,
+                "camera_aspect_ratio": current_aspect,
+                "num_pixels_x": current_n_pixels_x,
+                "num_pixels_y": current_n_pixels_y,
+                "refpoint_centre_lon": refPoints[0][0],
+                "refpoint_centre_lat": refPoints[0][1],
+                "refpoint_topleft_lon": refPoints[1][0],
+                "refpoint_topleft_lat": refPoints[1][1],
+                "refpoint_topright_lon": refPoints[2][0],
+                "refpoint_topright_lat": refPoints[2][1],
+                "refpoint_bottomleft_lon": refPoints[3][0],
+                "refpoint_bottomleft_lat": refPoints[3][1],
+                "refpoint_bottomright_lon": refPoints[4][0],
+                "refpoint_bottomright_lat": refPoints[4][1]
+            }
         
             if droneParams is not None:
                 for irow in range(len(droneParams)):

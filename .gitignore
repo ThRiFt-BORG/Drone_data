@@ -14,5 +14,12 @@ __pycache__
 .drone
 ### Ignore data ###
 data/**
-
-
+final_research_output/**
+Result/**
+images/**
+image_metadata.csv/**
+MRK_markers.csv/**
+mrk_markers.gpkg
+MRK_markers.qmd/**
+Drone Data/**
+validation_report.csv/**

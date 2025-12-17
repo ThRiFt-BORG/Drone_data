@@ -95,7 +95,7 @@ def run_pipeline():
 
     # --- Step 2: Kalman Filter ---
     print("\n--- Step 2: Applying Kalman Filter (Research-Grade) ---")
-    kalman_smoother.apply_kalman_filter(PROCESSED_CSV, SMOOTHED_CSV)
+    kalman_smoother.temporal_smooth_kalman(PROCESSED_CSV, SMOOTHED_CSV)
     
     if not os.path.exists(SMOOTHED_CSV):
         print("Error: Step 2 failed.")

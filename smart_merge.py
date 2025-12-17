@@ -1,49 +1,36 @@
 import pandas as pd
 import os
 import glob
-from PIL import Image
+import datetime
 
 # --- Configuration ---
 MRK_CSV_PATH = "MRK_markers.csv"
 IMAGE_DIRECTORY = "D:/WORK/Drone_Task/Drone_data/images" 
 OUTPUT_METADATA = "image_metadata.csv"
 
-# --- XMP Parser (Stolen from your previous extractor) ---
+# --- Helper: Parse Orientation from JPG header ---
 def parse_dji_xmp(filepath):
-    """
-    Scans the JPG header to find DJI Orientation tags.
-    """
-    xmp_data = {'Pitch': 0.0, 'Roll': 0.0, 'Yaw': 0.0}
+    # Initialize with floats
+    xmp = {'Pitch': 0.0, 'Roll': 0.0, 'Yaw': 0.0}
     try:
         with open(filepath, 'rb') as f:
-            # Read the first 100KB (Header usually contains XMP)
             content = f.read(100000)
-            
-            def find_tag(tag_name):
-                pattern = f'{tag_name}="'.encode('utf-8')
-                start = content.find(pattern)
-                if start != -1:
-                    start += len(pattern)
-                    end = content.find(b'"', start)
-                    if end != -1:
-                        try:
-                            return float(content[start:end])
-                        except ValueError:
-                            return None
+            def find(tag):
+                pat = f'{tag}="'.encode('utf-8')
+                s = content.find(pat)
+                if s != -1:
+                    e = content.find(b'"', s + len(pat))
+                    try: return float(content[s + len(pat):e])
+                    except: return None
                 return None
-
-            # Look for DJI specific tags
-            # Note: The PDF report implies these exist in your data
-            roll = find_tag('FlightRollDegree') or find_tag('GimbalRollDegree')
-            pitch = find_tag('FlightPitchDegree') or find_tag('GimbalPitchDegree')
-            yaw = find_tag('FlightYawDegree') or find_tag('GimbalYawDegree')
-
-            if roll is not None: xmp_data['Roll'] = roll
-            if pitch is not None: xmp_data['Pitch'] = pitch
-            if yaw is not None: xmp_data['Yaw'] = yaw
-    except Exception:
-        pass
-    return xmp_data
+            
+            # FIX: Add 'or 0.0' to ensure the result is always a float
+            xmp['Roll'] = find('FlightRollDegree') or find('GimbalRollDegree') or 0.0
+            xmp['Pitch'] = find('FlightPitchDegree') or find('GimbalPitchDegree') or 0.0
+            xmp['Yaw'] = find('FlightYawDegree') or find('GimbalYawDegree') or 0.0
+            
+    except: pass
+    return xmp
 
 def smart_merge():
     print(f"Reading {MRK_CSV_PATH}...")
@@ -53,89 +40,60 @@ def smart_merge():
         print("Error: MRK_markers.csv not found.")
         return
 
-    print(f"Loaded {len(mrk_df)} GPS records from MRK.")
-    print(f"Scanning {IMAGE_DIRECTORY} for orientation data...")
-
-    # 1. Map IDs to Real Files
-    id_to_filename = {}
+    print(f"Scanning images...")
+    id_to_file = {}
     all_files = glob.glob(os.path.join(IMAGE_DIRECTORY, "*"))
     
-    for filepath in all_files:
-        basename = os.path.basename(filepath)
-        name_part, ext = os.path.splitext(basename)
-        
-        if name_part.startswith("DJI_") and len(name_part) == 8:
+    for fp in all_files:
+        base = os.path.basename(fp)
+        name, ext = os.path.splitext(base)
+        if name.startswith("DJI_") and len(name)==8:
             try:
-                file_id = int(name_part.split('_')[1])
-                if ext.lower() in ['.jpg', '.jpeg', '.tif', '.tiff']:
-                    # Prefer JPG if available (easier to read XMP)
-                    if file_id in id_to_filename:
-                        if ext.lower() in ['.jpg', '.jpeg']:
-                            id_to_filename[file_id] = filepath
-                    else:
-                        id_to_filename[file_id] = filepath
-            except ValueError:
-                pass
+                fid = int(name.split('_')[1])
+                if fid not in id_to_file or ext.lower() in ['.jpg', '.jpeg']:
+                    id_to_file[fid] = fp
+            except: pass
 
-    print(f"Matched {len(id_to_filename)} physical files.")
-
-    # 2. Build Metadata CSV
+    print(f"Matched {len(id_to_file)} physical files.")
     output_rows = []
-    
-    for index, row in mrk_df.iterrows():
-        img_id = int(row['id'])
-        
-        if img_id in id_to_filename:
-            filepath = id_to_filename[img_id]
-            filename = os.path.basename(filepath)
+    base_date = datetime.datetime(2025, 1, 1)
+
+    for idx, row in mrk_df.iterrows():
+        fid = int(row['id'])
+        if fid in id_to_file:
+            fp = id_to_file[fid]
             
-            # A. Get High-Precision GPS (From MRK)
-            def to_dms(val, is_lat):
+            # --- CRITICAL FIX: Use MRK Timestamp ---
+            try:
+                # row['timestamp'] is GPS seconds
+                seconds_val = float(row['timestamp'])
+                flight_time = base_date + datetime.timedelta(seconds=seconds_val)
+                time_str = flight_time.strftime("%Y:%m:%d %H:%M:%S.%f")
+            except:
+                time_str = "2025:01:01 12:00:00.000000"
+
+            # Format GPS to DMS string
+            def dms(v, is_lat):
                 ref = 'N' if is_lat else 'E'
-                if val < 0:
-                    ref = 'S' if is_lat else 'W'
-                    val = abs(val)
-                d = int(val)
-                m = int((val - d) * 60)
-                s = (val - d - m/60) * 3600
+                if v < 0: ref, v = 'S' if is_lat else 'W', abs(v)
+                d = int(v); m = int((v-d)*60); s = (v-d-m/60)*3600
                 return f'{d} deg {m}\' {s:.2f}" {ref}'
 
-            lat_str = to_dms(row['lat'], True)
-            lon_str = to_dms(row['lon'], False)
-            alt_str = f"{row['altitude']} m Above Sea Level"
-
-            # B. Get Orientation (From Image XMP)
-            # If the file is a TIF, check if a matching JPG exists for metadata
-            base, ext = os.path.splitext(filepath)
-            jpg_candidate = base + ".JPG"
+            orient = parse_dji_xmp(fp)
             
-            # Read XMP from the file, or its JPG sidecar
-            if os.path.exists(jpg_candidate):
-                orient = parse_dji_xmp(jpg_candidate)
-            else:
-                orient = parse_dji_xmp(filepath)
-
             output_rows.append({
-                'FileName': filename,
-                'DateTimeOriginal': "2025:01:01 12:00:00", 
-                'GPSLatitude': lat_str,
-                'GPSLongitude': lon_str,
-                'GPSAltitude': alt_str,
-                'Pitch': orient['Pitch'],
-                'Roll': orient['Roll'],
-                'Yaw': orient['Yaw']
+                'FileName': os.path.basename(fp),
+                'DateTimeOriginal': time_str, 
+                'GPSLatitude': dms(row['lat'], True),
+                'GPSLongitude': dms(row['lon'], False),
+                'GPSAltitude': f"{row['altitude']} m Above Sea Level",
+                'Pitch': orient['Pitch'], 'Roll': orient['Roll'], 'Yaw': orient['Yaw']
             })
 
-    # 3. Save
     if output_rows:
-        out_df = pd.DataFrame(output_rows)
-        out_df.to_csv(OUTPUT_METADATA, index=False)
-        print("------------------------------------------------")
-        print(f"Success! Generated {len(out_df)} rows.")
-        print(f"Sample Orientation: Pitch={output_rows[0]['Pitch']}, Yaw={output_rows[0]['Yaw']}")
-        print("------------------------------------------------")
-    else:
-        print("Error: No matches found.")
+        pd.DataFrame(output_rows).to_csv(OUTPUT_METADATA, index=False)
+        print(f"Success! Saved {len(output_rows)} rows.")
+        print(f"Sample Time: {output_rows[0]['DateTimeOriginal']}")
 
 if __name__ == "__main__":
     smart_merge()

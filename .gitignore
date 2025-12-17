@@ -23,3 +23,8 @@ mrk_markers.gpkg
 MRK_markers.qmd/**
 Drone Data/**
 validation_report.csv/**
+debug_orientation_output/**
+Table_3_1_Velocity.csv/**
+Table_3_2_Positional_Shift.csv/**
+image_metadata.csv/**
+kalman_smoothed_metadata.csv/**
